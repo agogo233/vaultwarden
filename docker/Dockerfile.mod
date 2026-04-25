@@ -27,12 +27,12 @@
 #     $ docker image inspect --format "{{.RepoTags}}" docker.io/vaultwarden/web-vault@sha256:bf5aa55dc7bcb99f85d2a88ff44d32cdc832e934a0603fe28e5c3f92904bad42
 #     [docker.io/vaultwarden/web-vault:v2025.12.1_build.3]
 #
-FROM --platform=linux/amd64 ghcr.io/aothen/bw_web_builds AS vault
+FROM --platform=linux/amd64 ghcr.io/agogo233/bw_web_builds AS vault
 
 ########################## ALPINE BUILD IMAGES ##########################
 ## NOTE: The Alpine Base Images do not support other platforms then linux/amd64 and linux/arm64
 ## And for Alpine we define all build images here, they will only be loaded when actually used
-FROM --platform=$BUILDPLATFORM ghcr.io/aothen/rust-musl:amd64-x86_64-musl-stable-1.94.0 AS build_amd64
+FROM --platform=$BUILDPLATFORM ghcr.io/blackdex/rust-musl:amd64-x86_64-musl-stable-1.95.0 AS build_amd64
 
 
 ########################## BUILD IMAGE ##########################
