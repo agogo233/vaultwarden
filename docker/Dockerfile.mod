@@ -32,7 +32,7 @@ FROM --platform=linux/amd64 ghcr.io/agogo233/bw_web_builds AS vault
 ########################## ALPINE BUILD IMAGES ##########################
 ## NOTE: The Alpine Base Images do not support other platforms then linux/amd64 and linux/arm64
 ## And for Alpine we define all build images here, they will only be loaded when actually used
-FROM --platform=$BUILDPLATFORM ghcr.io/blackdex/rust-musl:amd64-x86_64-musl-stable-1.97.1 AS build_amd64
+FROM --platform=$BUILDPLATFORM ghcr.io/blackdex/rust-musl:x86_64-musl-stable-1.97.1 AS build_amd64
 
 
 ########################## BUILD IMAGE ##########################
@@ -65,7 +65,7 @@ RUN USER=root cargo new --bin /app
 WORKDIR /app
 
 # Environment variables for Cargo on Alpine based builds
-RUN echo "export CARGO_TARGET=${RUST_MUSL_CROSS_TARGET}" >> /env-cargo && \
+RUN echo "export CARGO_TARGET=${CARGO_BUILD_TARGET}" >> /env-cargo && \
     # Output the current contents of the file
     cat /env-cargo
 
