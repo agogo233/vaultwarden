@@ -10,7 +10,7 @@ use crate::{
     auth::{AdminHeaders, Headers},
     db::{
         DbConn, DbPool,
-        models::{Cipher, CipherId, Event, Membership, MembershipId, OrganizationId, UserId},
+        models::{Cipher, CipherId, Event, EventType, Membership, MembershipId, OrganizationId, UserId},
     },
     util::parse_date,
 };
@@ -52,7 +52,7 @@ async fn get_org_events(org_id: OrganizationId, data: EventRange, headers: Admin
             .map(Event::to_json)
             .collect()
     } else {
-        Vec::with_capacity(0)
+        Vec::new()
     };
 
     Ok(Json(json!({
@@ -78,7 +78,7 @@ async fn get_cipher_events(cipher_id: CipherId, data: EventRange, headers: Heade
 
         Event::find_by_cipher_uuid(&cipher_id, &start_date, &end_date, &conn).await.iter().map(Event::to_json).collect()
     } else {
-        Vec::with_capacity(0)
+        Vec::new()
     };
 
     Ok(Json(json!({
@@ -115,7 +115,7 @@ async fn get_user_events(
             .map(Event::to_json)
             .collect()
     } else {
-        Vec::with_capacity(0)
+        Vec::new()
     };
 
     Ok(Json(json!({
@@ -182,7 +182,10 @@ async fn post_events_collect(data: Json<Vec<EventCollection>>, headers: Headers,
                 .await;
             }
             1600..=1699 => {
-                if let Some(org_id) = &event.organization_id {
+                // Only allow logging events for an organization the user is actually a member of.
+                if let Some(org_id) = &event.organization_id
+                    && Membership::find_confirmed_by_user_and_org(&headers.user.uuid, org_id, &conn).await.is_some()
+                {
                     log_event_impl(
                         event.r#type,
                         org_id,
@@ -197,8 +200,11 @@ async fn post_events_collect(data: Json<Vec<EventCollection>>, headers: Headers,
                 }
             }
             _ => {
+                // The cipher determines the organization the event is logged to, so make sure the
+                // user can actually access it instead of trusting the provided cipher uuid.
                 if let Some(cipher_uuid) = &event.cipher_id
                     && let Some(cipher) = Cipher::find_by_uuid(cipher_uuid, &conn).await
+                    && cipher.is_accessible_to_user(&headers.user.uuid, &conn).await
                     && let Some(org_id) = cipher.organization_uuid
                 {
                     log_event_impl(
@@ -261,7 +267,7 @@ async fn log_user_event_impl(
 }
 
 pub async fn log_event(
-    event_type: i32,
+    event_type: EventType,
     source_uuid: &str,
     org_id: &OrganizationId,
     act_user_id: &UserId,
@@ -272,7 +278,7 @@ pub async fn log_event(
     if !CONFIG.org_events_enabled() {
         return;
     }
-    log_event_impl(event_type, source_uuid, org_id, act_user_id, device_type, None, ip, conn).await;
+    log_event_impl(event_type as i32, source_uuid, org_id, act_user_id, device_type, None, ip, conn).await;
 }
 
 #[expect(clippy::too_many_arguments)]

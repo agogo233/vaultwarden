@@ -96,6 +96,7 @@ pub fn routes() -> Vec<Route> {
         put_reset_password_enrollment,
         get_reset_password_details,
         put_reset_password,
+        put_recover_account,
         get_org_export,
         post_api_key,
         rotate_api_key,
@@ -268,7 +269,7 @@ async fn leave_organization(org_id: OrganizationId, headers: OrgMemberHeaders, c
     }
 
     log_event(
-        EventType::OrganizationUserLeft as i32,
+        EventType::OrganizationUserLeft,
         &membership.uuid,
         &org_id,
         &headers.user.uuid,
@@ -326,7 +327,7 @@ async fn post_organization(
     org.save(&conn).await?;
 
     log_event(
-        EventType::OrganizationUpdated as i32,
+        EventType::OrganizationUpdated,
         org_id.as_ref(),
         &org_id,
         &headers.user.uuid,
@@ -469,7 +470,7 @@ async fn get_org_collections_details(org_id: OrganizationId, headers: ManagerHea
                 .map(CollectionGroup::to_json_details_for_group)
                 .collect()
         } else {
-            Vec::with_capacity(0)
+            Vec::new()
         };
 
         let mut json_object = col.to_json_details(&headers.user.uuid, None, &conn).await;
@@ -513,7 +514,7 @@ async fn post_organization_collections(
     collection.save(&conn).await?;
 
     log_event(
-        EventType::CollectionCreated as i32,
+        EventType::CollectionCreated,
         &collection.uuid,
         &org_id,
         &headers.user.uuid,
@@ -576,6 +577,13 @@ async fn post_bulk_access_collections(
         err!("Can't find organization details")
     }
 
+    // The collections and members are checked below, the groups only here.
+    let org_groups = Group::find_by_organization(&org_id, &conn).await;
+    let org_group_ids: HashSet<&GroupId> = org_groups.iter().map(|g| &g.uuid).collect();
+    if let Some(g) = data.groups.iter().find(|g| !org_group_ids.contains(&g.id)) {
+        err!("Invalid group", format!("Group {} does not belong to organization {}!", g.id, org_id))
+    }
+
     for col_id in data.collection_ids {
         let Some(collection) = Collection::find_by_uuid_and_org(&col_id, &org_id, &conn).await else {
             err!("Collection not found")
@@ -589,7 +597,7 @@ async fn post_bulk_access_collections(
         collection.save(&conn).await?;
 
         log_event(
-            EventType::CollectionUpdated as i32,
+            EventType::CollectionUpdated,
             &collection.uuid,
             &org_id,
             &headers.user.uuid,
@@ -666,7 +674,7 @@ async fn post_organization_collection_update(
     collection.save(&conn).await?;
 
     log_event(
-        EventType::CollectionUpdated as i32,
+        EventType::CollectionUpdated,
         &collection.uuid,
         &org_id,
         &headers.user.uuid,
@@ -715,7 +723,7 @@ async fn delete_organization_collection_impl(
         err!("Collection not found", "Collection does not exist or does not belong to this organization")
     };
     log_event(
-        EventType::CollectionDeleted as i32,
+        EventType::CollectionDeleted,
         &collection.uuid,
         org_id,
         &headers.user.uuid,
@@ -805,7 +813,7 @@ async fn get_org_collection_detail(
             } else {
                 // The Bitwarden clients seem to call this API regardless of whether groups are enabled,
                 // so just act as if there are no groups.
-                Vec::with_capacity(0)
+                Vec::new()
             };
 
             // Generate a HashMap to get the correct MembershipType per user to determine the manage permission
@@ -945,6 +953,11 @@ async fn get_members(
     if org_id != headers.membership.org_uuid {
         err!("Organization not found", "Organization id's do not match");
     }
+
+    if !headers.membership.has_full_access() {
+        err_code!("Resource not found.", "User does not have full access", rocket::http::Status::NotFound.code);
+    }
+
     let mut users_json = Vec::new();
     for u in Membership::find_by_org(&org_id, &conn).await {
         users_json.push(
@@ -1089,9 +1102,13 @@ async fn send_invite(
                     err!(format!("User already in organization: {email}"))
                 }
 
-                // automatically accept existing users if mail is disabled
-                if !CONFIG.mail_enabled() && !user.password_hash.is_empty() {
-                    member_status = MembershipStatus::Accepted as i32;
+                if !CONFIG.mail_enabled() {
+                    if user.password_hash.is_empty() {
+                        Invitation::new(email).save(&conn).await?;
+                    } else {
+                        // automatically accept existing users if mail is disabled
+                        member_status = MembershipStatus::Accepted as i32;
+                    }
                 }
                 user
             }
@@ -1131,7 +1148,7 @@ async fn send_invite(
         }
 
         log_event(
-            EventType::OrganizationUserInvited as i32,
+            EventType::OrganizationUserInvited,
             &new_member.uuid,
             &org_id,
             &headers.user.uuid,
@@ -1162,6 +1179,9 @@ async fn send_invite(
         }
 
         for group_id in &data.groups {
+            if Group::find_by_uuid_and_org(group_id, &org_id, &conn).await.is_none() {
+                err!("Group not found in Organization")
+            }
             let mut group_entry = GroupUser::new(group_id.clone(), new_member.uuid.clone());
             group_entry.save(&conn).await?;
         }
@@ -1427,7 +1447,7 @@ async fn confirm_invite_impl(
     OrgPolicy::check_user_allowed(&member_to_confirm, "confirm", conn).await?;
 
     log_event(
-        EventType::OrganizationUserConfirmed as i32,
+        EventType::OrganizationUserConfirmed,
         &member_to_confirm.uuid,
         org_id,
         &headers.user.uuid,
@@ -1609,12 +1629,15 @@ async fn edit_member(
     GroupUser::delete_all_by_member(&member_to_edit.uuid, &conn).await?;
 
     for group_id in data.groups.iter().flatten() {
+        if Group::find_by_uuid_and_org(group_id, &org_id, &conn).await.is_none() {
+            err!("Group not found in Organization")
+        }
         let mut group_entry = GroupUser::new(group_id.clone(), member_to_edit.uuid.clone());
         group_entry.save(&conn).await?;
     }
 
     log_event(
-        EventType::OrganizationUserUpdated as i32,
+        EventType::OrganizationUserUpdated,
         &member_to_edit.uuid,
         &org_id,
         &headers.user.uuid,
@@ -1701,7 +1724,7 @@ async fn delete_member_impl(
     }
 
     log_event(
-        EventType::OrganizationUserRemoved as i32,
+        EventType::OrganizationUserRemoved,
         &member_to_delete.uuid,
         org_id,
         &headers.user.uuid,
@@ -1713,6 +1736,15 @@ async fn delete_member_impl(
 
     if let Some(user) = User::find_by_uuid(&member_to_delete.user_uuid, conn).await {
         nt.send_user_update(UpdateType::SyncOrgKeys, &user, headers.device.push_uuid.as_ref(), conn).await;
+
+        if !CONFIG.mail_enabled()
+            && !Membership::find_invited_by_user(&user.uuid, conn)
+                .await
+                .into_iter()
+                .any(|m| m.uuid != member_to_delete.uuid)
+        {
+            Invitation::take(&user.email, conn).await;
+        }
     }
 
     member_to_delete.delete(conn).await
@@ -1799,19 +1831,19 @@ async fn post_org_import(
     // TODO: See if we can optimize the whole cipher adding/importing and prevent duplicate code and checks.
     Cipher::validate_cipher_data(&data.ciphers)?;
 
-    let existing_collections: HashSet<Option<CollectionId>> =
-        Collection::find_by_organization(&org_id, &conn).await.into_iter().map(|c| Some(c.uuid)).collect();
+    let existing_collections: HashMap<CollectionId, Collection> =
+        Collection::find_by_organization(&org_id, &conn).await.into_iter().map(|c| (c.uuid.clone(), c)).collect();
     let mut collections: Vec<CollectionId> = Vec::with_capacity(data.collections.len());
     for col in data.collections {
-        let collection_uuid = if existing_collections.contains(&col.id) {
-            let col_id = col.id.unwrap();
-            // When not an Owner or Admin, check if the member is allowed to access the collection.
+        let existing = col.id.as_ref().and_then(|col_id| existing_collections.get(col_id));
+        let collection_uuid = if let Some(collection) = existing {
+            // When not an Owner or Admin, check if the member is allowed to write to the collection.
             if headers.membership.atype < MembershipType::Admin
-                && !Collection::can_access_collection(&headers.membership, &col_id, &conn).await
+                && !collection.is_writable_by_user(&headers.membership.user_uuid, &conn).await
             {
                 err!(Compact, "The current user isn't allowed to manage this collection")
             }
-            col_id
+            collection.uuid.clone()
         } else {
             // We do not allow users or managers which can not manage all collections to create new collections
             // If there is any collection other than an existing import collection, abort the import.
@@ -1839,6 +1871,8 @@ async fn post_org_import(
     for mut cipher_data in data.ciphers {
         // Always clear folder_id's via an organization import
         cipher_data.folder_id = None;
+        // Replace the client-provided, unvalidated organizationId with the real target org
+        cipher_data.organization_id = Some(org_id.clone());
         let mut cipher = Cipher::new(cipher_data.r#type, cipher_data.name.clone());
         update_cipher_from_data(
             &mut cipher,
@@ -1856,8 +1890,9 @@ async fn post_org_import(
 
     // Assign the collections
     for (cipher_index, col_index) in relations {
-        let cipher_id = &ciphers[cipher_index];
-        let col_id = &collections[col_index];
+        let (Some(cipher_id), Some(col_id)) = (ciphers.get(cipher_index), collections.get(col_index)) else {
+            err!(Compact, "Invalid collection relationship")
+        };
         CollectionCipher::save(cipher_id, col_id, &conn).await?;
     }
 
@@ -2020,18 +2055,27 @@ struct PolicyData {
     data: Option<Value>,
 }
 
+#[derive(Deserialize)]
+struct PutPolicy {
+    policy: PolicyData,
+    // Ignore metadata for now as we do not yet support this
+    // "metadata": {
+    //     "defaultUserCollectionName": "2.xx|xx==|xx="
+    // }
+}
+
 #[put("/organizations/<org_id>/policies/<pol_type>", data = "<data>")]
 async fn put_policy(
     org_id: OrganizationId,
     pol_type: i32,
-    data: Json<PolicyData>,
+    data: Json<PutPolicy>,
     headers: AdminHeaders,
     conn: DbConn,
 ) -> JsonResult {
     if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
-    let data: PolicyData = data.into_inner();
+    let data: PolicyData = data.into_inner().policy;
 
     let Some(pol_type_enum) = OrgPolicyType::from_i32(pol_type) else {
         err!("Invalid or unsupported policy type")
@@ -2100,7 +2144,7 @@ async fn put_policy(
                 }
 
                 log_event(
-                    EventType::OrganizationUserRemoved as i32,
+                    EventType::OrganizationUserRemoved,
                     &member.uuid,
                     &org_id,
                     &headers.user.uuid,
@@ -2126,7 +2170,7 @@ async fn put_policy(
     policy.save(&conn).await?;
 
     log_event(
-        EventType::PolicyUpdated as i32,
+        EventType::PolicyUpdated,
         policy.uuid.as_ref(),
         &org_id,
         &headers.user.uuid,
@@ -2139,26 +2183,16 @@ async fn put_policy(
     Ok(Json(policy.to_json()))
 }
 
-#[derive(Deserialize)]
-struct PolicyDataVnext {
-    policy: PolicyData,
-    // Ignore metadata for now as we do not yet support this
-    // "metadata": {
-    //     "defaultUserCollectionName": "2.xx|xx==|xx="
-    // }
-}
-
+// Deprecated with client v2026.5.0
 #[put("/organizations/<org_id>/policies/<pol_type>/vnext", data = "<data>")]
 async fn put_policy_vnext(
     org_id: OrganizationId,
     pol_type: i32,
-    data: Json<PolicyDataVnext>,
+    data: Json<PutPolicy>,
     headers: AdminHeaders,
     conn: DbConn,
 ) -> JsonResult {
-    let data: PolicyDataVnext = data.into_inner();
-    let policy: PolicyData = data.policy;
-    put_policy(org_id, pol_type, Json(policy), headers, conn).await
+    put_policy(org_id, pol_type, data, headers, conn).await
 }
 
 #[get("/plans")]
@@ -2305,7 +2339,7 @@ async fn revoke_member_impl(
             member.save(conn).await?;
 
             log_event(
-                EventType::OrganizationUserRevoked as i32,
+                EventType::OrganizationUserRevoked,
                 &member.uuid,
                 org_id,
                 &headers.user.uuid,
@@ -2403,7 +2437,7 @@ async fn restore_member_impl(
             member.save(conn).await?;
 
             log_event(
-                EventType::OrganizationUserRestored as i32,
+                EventType::OrganizationUserRestored,
                 &member.uuid,
                 org_id,
                 &headers.user.uuid,
@@ -2428,6 +2462,23 @@ async fn get_groups_data(
     if org_id != headers.membership.org_uuid {
         err!("Organization not found", "Organization id's do not match");
     }
+
+    // The details view (group→collection/user mappings) needs full org access; the plain list only
+    // needs manage access to a collection, so a manager of a collection (directly or via a group)
+    // can load it to assign groups.
+    let has_full_access = headers.membership.has_full_access()
+        || (CONFIG.org_groups_enabled()
+            && GroupUser::has_full_access_by_member(&org_id, &headers.membership.uuid, &conn).await);
+    let allowed = if details {
+        has_full_access
+    } else {
+        has_full_access
+            || Collection::has_manageable_collection_by_user(&org_id, &headers.membership.user_uuid, &conn).await
+    };
+    if !allowed {
+        err_code!("Resource not found.", "User does not have access", rocket::http::Status::NotFound.code);
+    }
+
     let groups: Vec<Value> = if CONFIG.org_groups_enabled() {
         let groups = Group::find_by_organization(&org_id, &conn).await;
         let mut groups_json = Vec::with_capacity(groups.len());
@@ -2445,7 +2496,7 @@ async fn get_groups_data(
     } else {
         // The Bitwarden clients seem to call this API regardless of whether groups are enabled,
         // so just act as if there are no groups.
-        Vec::with_capacity(0)
+        Vec::new()
     };
 
     Ok(Json(json!({
@@ -2554,7 +2605,7 @@ async fn post_groups(
     let group = group_request.to_group(&org_id);
 
     log_event(
-        EventType::GroupCreated as i32,
+        EventType::GroupCreated,
         &group.uuid,
         &org_id,
         &headers.user.uuid,
@@ -2595,7 +2646,7 @@ async fn put_group(
     GroupUser::delete_all_by_group(&group_id, &org_id, &conn).await?;
 
     log_event(
-        EventType::GroupUpdated as i32,
+        EventType::GroupUpdated,
         &updated_group.uuid,
         &org_id,
         &headers.user.uuid,
@@ -2628,7 +2679,7 @@ async fn add_update_group(
         user_entry.save(conn).await?;
 
         log_event(
-            EventType::OrganizationUserUpdatedGroups as i32,
+            EventType::OrganizationUserUpdatedGroups,
             &assigned_member,
             &org_id,
             &headers.user.uuid,
@@ -2703,7 +2754,7 @@ async fn delete_group_impl(
     };
 
     log_event(
-        EventType::GroupDeleted as i32,
+        EventType::GroupDeleted,
         &group.uuid,
         org_id,
         &headers.user.uuid,
@@ -2814,7 +2865,7 @@ async fn put_group_members(
         user_entry.save(&conn).await?;
 
         log_event(
-            EventType::OrganizationUserUpdatedGroups as i32,
+            EventType::OrganizationUserUpdatedGroups,
             &assigned_member,
             &org_id,
             &headers.user.uuid,
@@ -2852,7 +2903,7 @@ async fn post_delete_group_member(
     }
 
     log_event(
-        EventType::OrganizationUserUpdatedGroups as i32,
+        EventType::OrganizationUserUpdatedGroups,
         &member_id,
         &org_id,
         &headers.user.uuid,
@@ -2875,9 +2926,14 @@ struct OrganizationUserResetPasswordEnrollmentRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct OrganizationUserResetPasswordRequest {
+struct OrganizationUserRecoverAccountRequest {
     new_master_password_hash: String,
     key: String,
+
+    #[serde(default)]
+    reset_master_password: bool,
+    #[serde(default)]
+    reset_two_factor: bool,
 }
 
 // Upstream reports this is the renamed endpoint instead of `/keys`
@@ -2905,12 +2961,43 @@ async fn get_organization_keys(org_id: OrganizationId, headers: OrgMemberHeaders
     get_organization_public_key(org_id, headers, conn).await
 }
 
+// Will allow to reset 2FA too
+// https://github.com/bitwarden/clients/blob/web-v2026.4.2/libs/admin-console/src/common/organization-user/models/requests/organization-user-reset-password.request.ts
+#[put("/organizations/<org_id>/users/<member_id>/recover-account", data = "<data>")]
+async fn put_recover_account(
+    org_id: OrganizationId,
+    member_id: MembershipId,
+    headers: AdminHeaders,
+    data: Json<OrganizationUserRecoverAccountRequest>,
+    conn: DbConn,
+    nt: Notify<'_>,
+) -> EmptyResult {
+    let req = data.into_inner();
+    if req.reset_master_password && !req.reset_two_factor {
+        recover_account(org_id, member_id, headers, req, conn, nt).await
+    } else {
+        err!("Unsupported operation")
+    }
+}
+
+// Deprecated since `v2026.4.2`
 #[put("/organizations/<org_id>/users/<member_id>/reset-password", data = "<data>")]
 async fn put_reset_password(
     org_id: OrganizationId,
     member_id: MembershipId,
     headers: AdminHeaders,
-    data: Json<OrganizationUserResetPasswordRequest>,
+    data: Json<OrganizationUserRecoverAccountRequest>,
+    conn: DbConn,
+    nt: Notify<'_>,
+) -> EmptyResult {
+    recover_account(org_id, member_id, headers, data.into_inner(), conn, nt).await
+}
+
+async fn recover_account(
+    org_id: OrganizationId,
+    member_id: MembershipId,
+    headers: AdminHeaders,
+    reset_request: OrganizationUserRecoverAccountRequest,
     conn: DbConn,
     nt: Notify<'_>,
 ) -> EmptyResult {
@@ -2944,8 +3031,6 @@ async fn put_reset_password(
         err!(format!("Error sending user reset password email: {e:#?}"));
     }
 
-    let reset_request = data.into_inner();
-
     let mut user = user;
     user.set_password(reset_request.new_master_password_hash.as_str(), Some(reset_request.key), true, None, &conn)
         .await?;
@@ -2954,7 +3039,7 @@ async fn put_reset_password(
     nt.send_logout(&user, None, &conn).await;
 
     log_event(
-        EventType::OrganizationUserAdminResetPassword as i32,
+        EventType::OrganizationUserAdminResetPassword,
         &member_id,
         &org_id,
         &headers.user.uuid,
@@ -3081,9 +3166,9 @@ async fn put_reset_password_enrollment(
     membership.save(&conn).await?;
 
     let event_type = if membership.reset_password_key.is_some() {
-        EventType::OrganizationUserResetPasswordEnroll as i32
+        EventType::OrganizationUserResetPasswordEnroll
     } else {
-        EventType::OrganizationUserResetPasswordWithdraw as i32
+        EventType::OrganizationUserResetPasswordWithdraw
     };
 
     log_event(event_type, &membership.uuid, &org_id, &headers.user.uuid, headers.device.atype, &headers.ip.ip, &conn)

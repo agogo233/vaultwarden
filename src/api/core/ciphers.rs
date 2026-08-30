@@ -167,7 +167,7 @@ async fn sync(data: SyncData, headers: Headers, client_version: Option<ClientVer
         api::core::get_eq_domains(&headers, true).into_inner()
     };
 
-    // This is very similar to the the userDecryptionOptions sent in connect/token,
+    // This is very similar to the userDecryptionOptions sent in connect/token,
     // but as of 2025-12-19 they're both using different casing conventions.
     let has_master_password = !headers.user.password_hash.is_empty();
     let master_password_unlock = if has_master_password {
@@ -450,7 +450,9 @@ pub async fn update_cipher_from_data(
         match Membership::find_confirmed_by_user_and_org(&headers.user.uuid, &org_id, conn).await {
             None => err!("You don't have permission to add item to organization"),
             Some(member) => {
-                if shared_to_collections.is_some()
+                // A non-empty list of collections implies the caller already validated the user's write
+                // access to them, so we can move the cipher into the organization on that basis.
+                if shared_to_collections.as_ref().is_some_and(|cols| !cols.is_empty())
                     || member.has_full_access()
                     || cipher.is_write_accessible_to_user(&headers.user.uuid, conn).await
                 {
@@ -551,16 +553,8 @@ pub async fn update_cipher_from_data(
                 (_, _) => EventType::CipherUpdated,
             };
 
-            log_event(
-                event_type as i32,
-                &cipher.uuid,
-                org_id,
-                &headers.user.uuid,
-                headers.device.atype,
-                &headers.ip.ip,
-                conn,
-            )
-            .await;
+            log_event(event_type, &cipher.uuid, org_id, &headers.user.uuid, headers.device.atype, &headers.ip.ip, conn)
+                .await;
         }
         nt.send_cipher_update(
             ut,
@@ -629,7 +623,7 @@ async fn post_ciphers_import(data: Json<ImportData>, headers: Headers, conn: DbC
 
     // Read and create the ciphers
     for (index, mut cipher_data) in data.ciphers.into_iter().enumerate() {
-        let folder_id = relations_map.get(&index).map(|i| folders[*i].clone());
+        let folder_id = relations_map.get(&index).and_then(|i| folders.get(*i).cloned());
         cipher_data.folder_id = folder_id;
 
         let mut cipher = Cipher::new(cipher_data.r#type, cipher_data.name.clone());
@@ -848,7 +842,7 @@ async fn post_collections_update(
     .await;
 
     log_event(
-        EventType::CipherUpdatedCollections as i32,
+        EventType::CipherUpdatedCollections,
         &cipher.uuid,
         org_uuid,
         &headers.user.uuid,
@@ -868,7 +862,7 @@ async fn put_collections_admin(
     headers: Headers,
     conn: DbConn,
     nt: Notify<'_>,
-) -> EmptyResult {
+) -> JsonResult {
     post_collections_admin(cipher_id, data, headers, conn, nt).await
 }
 
@@ -879,7 +873,7 @@ async fn post_collections_admin(
     headers: Headers,
     conn: DbConn,
     nt: Notify<'_>,
-) -> EmptyResult {
+) -> JsonResult {
     let data: CollectionsAdminData = data.into_inner();
 
     let Some(cipher) = Cipher::find_by_uuid(&cipher_id, &conn).await else {
@@ -928,7 +922,7 @@ async fn post_collections_admin(
     .await;
 
     log_event(
-        EventType::CipherUpdatedCollections as i32,
+        EventType::CipherUpdatedCollections,
         &cipher.uuid,
         org_uuid,
         &headers.user.uuid,
@@ -938,7 +932,7 @@ async fn post_collections_admin(
     )
     .await;
 
-    Ok(())
+    Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::Organization, &conn).await?))
 }
 
 #[derive(Deserialize)]
@@ -1042,6 +1036,13 @@ async fn share_cipher_by_uuid(
     } else {
         err!("Cipher doesn't exist")
     };
+
+    // `update_cipher_from_data()` rejects this too, but only after the collections below were
+    // already linked. There are no transactions, so that would leave the cipher linked to a
+    // collection of another organization.
+    if cipher.organization_uuid.is_some() && cipher.organization_uuid != data.cipher.organization_id {
+        err!("Organization mismatch. Please resync the client before updating the cipher")
+    }
 
     let mut shared_to_collections = vec![];
 
@@ -1326,7 +1327,7 @@ async fn save_attachment(
 
     if let Some(org_id) = &cipher.organization_uuid {
         log_event(
-            EventType::CipherAttachmentCreated as i32,
+            EventType::CipherAttachmentCreated,
             &cipher.uuid,
             org_id,
             &headers.user.uuid,
@@ -1687,7 +1688,7 @@ async fn purge_org_vault(
             nt.send_user_update(UpdateType::SyncVault, &user, headers.device.push_uuid.as_ref(), &conn).await;
 
             log_event(
-                EventType::OrganizationPurgedVault as i32,
+                EventType::OrganizationPurgedVault,
                 &organization.org_id,
                 &organization.org_id,
                 &user.uuid,
@@ -1815,9 +1816,9 @@ async fn delete_cipher_by_uuid(
         let event_type = if *delete_options == CipherDeleteOptions::SoftSingle
             || *delete_options == CipherDeleteOptions::SoftMulti
         {
-            EventType::CipherSoftDeleted as i32
+            EventType::CipherSoftDeleted
         } else {
-            EventType::CipherDeleted as i32
+            EventType::CipherDeleted
         };
 
         log_event(event_type, &cipher.uuid, &org_id, &headers.user.uuid, headers.device.atype, &headers.ip.ip, conn)
@@ -1886,7 +1887,7 @@ async fn restore_cipher_by_uuid(
 
     if let Some(org_id) = &cipher.organization_uuid {
         log_event(
-            EventType::CipherRestored as i32,
+            EventType::CipherRestored,
             &cipher.uuid.clone(),
             org_id,
             &headers.user.uuid,
@@ -1963,7 +1964,7 @@ async fn delete_cipher_attachment_by_id(
 
     if let Some(ref org_id) = cipher.organization_uuid {
         log_event(
-            EventType::CipherAttachmentDeleted as i32,
+            EventType::CipherAttachmentDeleted,
             &cipher.uuid,
             org_id,
             &headers.user.uuid,
@@ -2135,9 +2136,9 @@ impl CipherSyncData {
             // Organization Sync does not support Folders, Favorites, or Archives.
             // If these are set, it will cause issues in the web-vault.
             CipherSyncType::Organization => {
-                cipher_folders = HashMap::with_capacity(0);
-                cipher_favorites = HashSet::with_capacity(0);
-                cipher_archives = HashMap::with_capacity(0);
+                cipher_folders = HashMap::new();
+                cipher_favorites = HashSet::new();
+                cipher_archives = HashMap::new();
             }
         }
 

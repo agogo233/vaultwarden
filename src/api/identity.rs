@@ -31,8 +31,8 @@ use crate::{
         DbConn,
         models::{
             AuthRequest, AuthRequestId, Device, DeviceId, EventType, Invitation, OIDCCodeResponseError,
-            OrganizationApiKey, OrganizationId, SsoAuth, SsoUser, TwoFactor, TwoFactorIncomplete, TwoFactorType, User,
-            UserId,
+            OrganizationApiKey, OrganizationId, SendId, SsoAuth, SsoUser, TwoFactor, TwoFactorIncomplete,
+            TwoFactorType, User, UserId,
         },
     },
     error::MapResult,
@@ -108,6 +108,20 @@ async fn login(
             sso_login(data, &mut user_id, &conn, &client_header.ip, client_version.as_ref()).await
         }
         "authorization_code" => err!("SSO sign-in is not available"),
+        "send_access" => {
+            crate::ratelimit::check_limit_unauthenticated(&client_header.ip.ip)?;
+            check_is_some(data.client_id.as_ref(), "client_id cannot be blank")?;
+            check_is_some(data.send_id.as_ref(), "send_id cannot be blank")?;
+
+            let tokens = auth::SendTokens::generate_tokens(
+                data.send_id.as_ref().unwrap(),
+                data.password_hash_b64,
+                &client_header.ip,
+                &conn,
+            )
+            .await?;
+            Ok(Json(tokens.to_json()))
+        }
         t => err!("Invalid type", t),
     };
 
@@ -220,6 +234,24 @@ async fn sso_login(
                     }
                 )
             }
+            Some((user, None))
+                if user.private_key.is_none()
+                    && !CONFIG.sso_signups_allowed()
+                    && !CONFIG.is_email_domain_allowed(&user.email)
+                    && !CONFIG.mail_enabled()
+                    && Invitation::find_by_mail(&user.email, conn).await.is_none() =>
+            {
+                error!(
+                    "Login failure ({}), no invitation with email ({}) was found",
+                    user_infos.identifier, user.email
+                );
+                err_silent!(
+                    "Missing invitation",
+                    ErrorEvent {
+                        event: EventType::UserFailedLogIn
+                    }
+                )
+            }
             Some((user, None)) if user.private_key.is_some() && !CONFIG.sso_signups_match_email() => {
                 error!(
                     "Login failure ({}), existing non SSO user ({}) with same email ({}) and association is disabled",
@@ -267,7 +299,15 @@ async fn sso_login(
     // Will trigger 2FA flow if needed
     let (user, mut device, twofactor_token, sso_user) = match user_with_sso {
         None => {
-            if !CONFIG.is_email_domain_allowed(&user_infos.email) {
+            if !CONFIG.is_sso_signup_allowed(&user_infos.email) {
+                if CONFIG.signups_domains_whitelist().is_empty() {
+                    err!(
+                        "Signups are disabled. You will need an invitation",
+                        ErrorEvent {
+                            event: EventType::UserFailedLogIn
+                        }
+                    );
+                }
                 err!(
                     "Email domain not allowed",
                     ErrorEvent {
@@ -304,7 +344,7 @@ async fn sso_login(
         Some((user, _)) if !user.enabled => {
             err!(
                 "This user has been disabled",
-                format!("IP: {}. Username: {}.", ip.ip, user.display_name()),
+                format!("IP: {}. Username: {}.", ip.ip, user.email),
                 ErrorEvent {
                     event: EventType::UserFailedLogIn
                 }
@@ -563,7 +603,7 @@ async fn authenticated_response(
         result["TwoFactorToken"] = Value::String(token);
     }
 
-    info!("User {} logged in successfully. IP: {}", user.display_name(), ip.ip);
+    info!("User {} logged in successfully. IP: {}", user.email, ip.ip);
     Ok(Json(result))
 }
 
@@ -1042,8 +1082,11 @@ enum RegisterVerificationResponse {
 #[post("/accounts/register/send-verification-email", data = "<data>")]
 async fn register_verification_email(
     data: Json<RegisterVerificationData>,
+    ip: ClientIp,
     conn: DbConn,
 ) -> ApiResult<RegisterVerificationResponse> {
+    crate::ratelimit::check_limit_unauthenticated(&ip.ip)?;
+
     let data = data.into_inner();
 
     // the registration can only continue if signup is allowed or there exists an invitation
@@ -1144,6 +1187,10 @@ struct ConnectData {
     code: Option<OIDCCode>,
     #[field(name = uncased("code_verifier"))]
     code_verifier: Option<OIDCCodeVerifier>,
+
+    // Needed for send access
+    send_id: Option<SendId>,
+    password_hash_b64: Option<String>,
 }
 fn check_is_some<T>(value: Option<&T>, msg: &str) -> EmptyResult {
     if value.is_none() {
