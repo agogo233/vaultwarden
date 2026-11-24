@@ -32,7 +32,7 @@ FROM --platform=linux/amd64 ghcr.io/agogo233/bw_web_builds AS vault
 ########################## ALPINE BUILD IMAGES ##########################
 ## NOTE: The Alpine Base Images do not support other platforms then linux/amd64 and linux/arm64
 ## And for Alpine we define all build images here, they will only be loaded when actually used
-FROM --platform=$BUILDPLATFORM ghcr.io/blackdex/rust-musl:x86_64-musl-stable-1.99.1 AS build_amd64
+FROM --platform=$BUILDPLATFORM ghcr.io/blackdex/rust-musl:x86_64-musl-stable-1.100.0 AS build_amd64
 
 
 ########################## BUILD IMAGE ##########################
